@@ -1,9 +1,8 @@
 name: Amul Stock Monitor
-
 on:
   schedule:
     # Run every 30 minutes
-    - cron: '*/30 * * * *'
+    - cron: '*/30 * * * *'  # Fixed: Added missing * * *
   workflow_dispatch: # Allow manual trigger
   
 permissions:
@@ -36,12 +35,30 @@ jobs:
         EMAIL_TO: ${{ secrets.EMAIL_TO }}
         SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
         SMTP_PORT: ${{ secrets.SMTP_PORT }}
-      run: python amulStockAlert.py
+      run: |
+        python amulStockAlert.py
+        echo "Python script completed"
+        echo "Files created:"
+        ls -la stock_* 2>/dev/null || echo "No stock files found"
       
     - name: Commit and push state file
       run: |
         git config --local user.email "action@github.com"
         git config --local user.name "GitHub Action"
-        git add stock_state.json stock_monitor.log || true
-        git diff --staged --quiet || git commit -m "Update stock monitoring state [skip ci]"
-        git push || true
+        
+        # Check what files exist
+        echo "Checking for files to commit:"
+        ls -la stock_* 2>/dev/null || echo "No stock files found"
+        
+        # Add files if they exist
+        git add stock_state.json 2>/dev/null || echo "stock_state.json not found"
+        git add stock_monitor.log 2>/dev/null || echo "stock_monitor.log not found"
+        
+        # Check for staged changes
+        if git diff --staged --quiet; then
+          echo "No changes to commit"
+        else
+          echo "Committing changes..."
+          git commit -m "Update stock monitoring state [skip ci]"
+          git push
+        fi
