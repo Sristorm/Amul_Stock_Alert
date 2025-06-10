@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import List, Dict, Optional
 import os
 from dataclasses import dataclass
+import re
 
 # Configure logging
 logging.basicConfig(
@@ -28,7 +29,7 @@ class Product:
     price_selector: Optional[str] = None
 
 class StockMonitor:
-    def __init__(self):
+    def __init__(self, debug_mode=False, force_notify=False):
         # Configuration - use environment variables for security
         self.telegram_bot_token = os.getenv('TELEGRAM_BOT_TOKEN')
         self.telegram_chat_id = os.getenv('TELEGRAM_CHAT_ID')
@@ -37,6 +38,10 @@ class StockMonitor:
         self.email_to = os.getenv('EMAIL_TO')
         self.smtp_server = os.getenv('SMTP_SERVER', 'smtp.gmail.com')
         self.smtp_port = int(os.getenv('SMTP_PORT', '587'))
+        
+        # Debug and testing options
+        self.debug_mode = debug_mode
+        self.force_notify = force_notify
         
         # Products to monitor - customize these URLs and selectors
         self.products = [
@@ -64,8 +69,6 @@ class StockMonitor:
                 selector="add-to-cart",
                 price_selector=".price"
             )
-
-            # Add more products here
         ]
         
         # File to store previous state
@@ -102,54 +105,9 @@ class StockMonitor:
             response = self.session.get(product.url, timeout=30)
             response.raise_for_status()
             
-            content = response.text.lower()
-            
-            # Check for availability indicators
-            available = False
-            price = None
-            
-            # Common availability indicators
-            availability_indicators = [
-                'add to cart',
-                'buy now',
-                'in stock',
-                'available',
-                product.selector.lower()
-            ]
-            
-            unavailability_indicators = [
-                'out of stock',
-                'sold out',
-                'unavailable',
-                'notify when available',
-                'coming soon'
-            ]
-            
-            # Check availability
-            for indicator in availability_indicators:
-                if indicator in content:
-                    available = True
-                    break
-            
-            # Override if unavailable indicators found
-            for indicator in unavailability_indicators:
-                if indicator in content:
-                    available = False
-                    break
-            
-            # Try to extract price if available
-            if product.price_selector and available:
-                try:
-                    from bs4 import BeautifulSoup
-                    soup = BeautifulSoup(response.text, 'html.parser')
-                    price_element = soup.select_one(product.price_selector)
-                    if price_element:
-                        price = price_element.get_text(strip=True)
-                except ImportError:
-                    # BeautifulSoup not available, skip price extraction
-                    pass
-                except Exception as e:
-                    logging.warning(f"Error extracting price for {product.name}: {e}")
+            content = response.text
+            available = self.is_product_available(content, product)
+            price = self.extract_price(content, product) if available else None
             
             return {
                 'available': available,
@@ -167,131 +125,106 @@ class StockMonitor:
                 'error': str(e)
             }
 
-    def send_telegram_message(self, message: str) -> bool:
-        """Send message via Telegram bot"""
-        if not self.telegram_bot_token or not self.telegram_chat_id:
-            logging.warning("Telegram credentials not configured")
-            return False
-        
+    def is_product_available(self, content: str, product: Product) -> bool:
+        """Enhanced availability detection logic"""
         try:
-            url = f"https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage"
-            data = {
-                'chat_id': self.telegram_chat_id,
-                'text': message,
-                'parse_mode': 'HTML'
-            }
-            response = requests.post(url, data=data, timeout=10)
-            response.raise_for_status()
-            return True
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(content, 'html.parser')
+            
+            # Method 1: Check for enabled "Add to Cart" buttons
+            add_to_cart_buttons = soup.find_all('a', class_='add-to-cart')
+            for button in add_to_cart_buttons:
+                button_text = button.get_text(strip=True).lower()
+                
+                # Only check buttons that actually say "Add to Cart"
+                if 'add to cart' in button_text:
+                    disabled = button.get('disabled')
+                    
+                    # For Amul website: disabled="0" means ENABLED, disabled="1" or missing means DISABLED
+                    # Also check for other disabled indicators
+                    if disabled is None:
+                        # No disabled attribute - could be enabled
+                        # Check if button has proper onclick or href
+                        if button.get('href') or button.get('onclick') or not button.get('disabled'):
+                            return True
+                    elif str(disabled) == "0":
+                        # disabled="0" means the button is actually ENABLED
+                        return True
+                    elif str(disabled) == "1" or str(disabled).lower() == "true":
+                        # disabled="1" or disabled="true" means actually disabled
+                        continue
+                    
+                    # Additional check: look for CSS classes that might indicate disabled state
+                    button_classes = button.get('class', [])
+                    if any(cls in ['disabled', 'btn-disabled', 'out-of-stock'] for cls in button_classes):
+                        continue
+                    
+                    # If we reach here and have an "Add to Cart" button without clear disabled indicators
+                    return True
+            
+            # Method 2: Check for quantity input field (indicates available product)
+            quantity_inputs = soup.find_all('input', {'type': 'text'})
+            for input_field in quantity_inputs:
+                if input_field.get('placeholder') == 'Quantity' and not input_field.get('disabled'):
+                    # If quantity selector is present and not disabled, product is likely available
+                    return True
+            
+            # Method 3: Check for price information (strong indicator of availability)
+            price_elements = soup.find_all(class_=lambda x: x and ('price' in x.lower() or 'mrp' in x.lower()))
+            if price_elements:
+                # If price is shown, product is likely available
+                for price_elem in price_elements:
+                    price_text = price_elem.get_text(strip=True)
+                    if '₹' in price_text or 'rs' in price_text.lower():
+                        return True
+            
+            # Method 4: Text-based checks (fallback)
+            content_lower = content.lower()
+            
+            # Strong indicators of unavailability (these override availability)
+            unavailable_patterns = [
+                'out of stock',
+                'sold out',
+                'currently unavailable',
+                'notify when available',
+                'coming soon',
+                'temporarily out of stock',
+                'not available',
+                'stock not available',
+                'currently out of stock'
+            ]
+            
+            for pattern in unavailable_patterns:
+                if pattern in content_lower:
+                    return False
+            
+            # Check for availability indicators
+            available_patterns = [
+                'in stock',
+                'available now',
+                'buy now',
+                'available for purchase',
+                'add to cart'
+            ]
+            
+            for pattern in available_patterns:
+                if pattern in content_lower:
+                    # Double-check it's in a positive context
+                    if 'not ' + pattern not in content_lower and 'no ' + pattern not in content_lower:
+                        return True
+            
+            return False
+            
+        except ImportError:
+            # Fallback to text-based detection if BeautifulSoup is not available
+            logging.warning("BeautifulSoup not available, using text-based detection")
+            return self.text_based_availability_check(content)
         except Exception as e:
-            logging.error(f"Error sending Telegram message: {e}")
-            return False
+            logging.warning(f"Error in availability detection for {product.name}: {e}")
+            return self.text_based_availability_check(content)
 
-    def send_email(self, subject: str, body: str) -> bool:
-        """Send email notification"""
-        if not all([self.email_from, self.email_password, self.email_to]):
-            logging.warning("Email credentials not configured")
-            return False
+    def text_based_availability_check(self, content: str) -> bool:
+        """Fallback text-based availability check"""
+        content_lower = content.lower()
         
-        try:
-            msg = MIMEMultipart()
-            msg['From'] = self.email_from
-            msg['To'] = self.email_to
-            msg['Subject'] = subject
-            
-            msg.attach(MIMEText(body, 'html'))
-            
-            server = smtplib.SMTP(self.smtp_server, self.smtp_port)
-            server.starttls()
-            server.login(self.email_from, self.email_password)
-            server.send_message(msg)
-            server.quit()
-            return True
-        except Exception as e:
-            logging.error(f"Error sending email: {e}")
-            return False
-
-    def format_notification_message(self, product: Product, status: Dict, status_change: str) -> str:
-        """Format notification message"""
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        message = f"🛍️ <b>Amul Stock Alert</b>\n\n"
-        message += f"📦 <b>Product:</b> {product.name}\n"
-        message += f"🔗 <b>URL:</b> {product.url}\n"
-        message += f"📊 <b>Status:</b> {status_change}\n"
-        
-        if status.get('price'):
-            message += f"💰 <b>Price:</b> {status['price']}\n"
-        
-        message += f"🕒 <b>Checked at:</b> {timestamp}\n"
-        
-        if status['available']:
-            message += "\n✅ <b>Product is now available! Hurry up!</b>"
-        else:
-            message += "\n❌ <b>Product is out of stock</b>"
-        
-        return message
-
-    def monitor_products(self):
-        """Main monitoring function"""
-        logging.info("Starting product monitoring...")
-        current_state = {}
-        notifications_sent = []
-        
-        for product in self.products:
-            logging.info(f"Checking {product.name}...")
-            
-            status = self.check_product_availability(product)
-            current_state[product.name] = status
-            
-            # Check if status changed
-            previous_status = self.previous_state.get(product.name, {})
-            previous_available = previous_status.get('available', False)
-            current_available = status['available']
-            
-            if previous_available != current_available:
-                status_change = "Available ✅" if current_available else "Out of Stock ❌"
-                message = self.format_notification_message(product, status, status_change)
-                
-                # Send notifications
-                telegram_sent = self.send_telegram_message(message)
-                email_sent = self.send_email(
-                    f"Amul Stock Alert: {product.name} - {status_change}",
-                    message.replace('<b>', '').replace('</b>', '').replace('\n', '<br>')
-                )
-                
-                notifications_sent.append({
-                    'product': product.name,
-                    'status': status_change,
-                    'telegram_sent': telegram_sent,
-                    'email_sent': email_sent
-                })
-                
-                logging.info(f"Status changed for {product.name}: {status_change}")
-            
-            # Rate limiting
-            time.sleep(2)
-        
-        # Save current state
-        self.save_state(current_state)
-        self.previous_state = current_state
-        
-        # Log summary
-        if notifications_sent:
-            logging.info(f"Sent {len(notifications_sent)} notifications")
-            for notification in notifications_sent:
-                logging.info(f"  {notification}")
-        else:
-            logging.info("No status changes detected")
-
-def main():
-    """Main function to run the monitor"""
-    try:
-        monitor = StockMonitor()
-        monitor.monitor_products()
-    except KeyboardInterrupt:
-        logging.info("Monitoring stopped by user")
-    except Exception as e:
-        logging.error(f"Unexpected error: {e}")
-
-if __name__ == "__main__":
-    main()
+        #
