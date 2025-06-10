@@ -5,7 +5,10 @@ on:
     # Run every 30 minutes
     - cron: '*/30 * * * *'
   workflow_dispatch: # Allow manual trigger
-
+  
+permissions:
+  contents: write
+  
 jobs:
   monitor:
     runs-on: ubuntu-latest
