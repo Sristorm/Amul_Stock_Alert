@@ -30,7 +30,7 @@ class Product:
 
 class StockMonitor:
     def __init__(self, debug_mode=False, force_notify=False):
-        # Configuration - use environment variables for security
+        Configuration - use environment variables for security
         self.telegram_bot_token = os.getenv('TELEGRAM_BOT_TOKEN')
         self.telegram_chat_id = os.getenv('TELEGRAM_CHAT_ID')
         self.email_from = os.getenv('EMAIL_FROM')
@@ -98,6 +98,27 @@ class StockMonitor:
                 json.dump(state, f, indent=2)
         except Exception as e:
             logging.error(f"Error saving state: {e}")
+
+    def ensure_files_exist(self):
+        """Ensure state and log files exist, create them if they don't"""
+        try:
+            # Ensure log file exists
+            if not os.path.exists('stock_monitor.log'):
+                with open('stock_monitor.log', 'w') as f:
+                    f.write(f"{datetime.now().isoformat()} - Stock monitor log initialized\n")
+            
+            # Ensure state file exists
+            if not os.path.exists(self.state_file):
+                initial_state = {
+                    'initialized': datetime.now().isoformat(),
+                    'last_run': None
+                }
+                self.save_state(initial_state)
+            
+            print(f"Files ensured to exist: {os.path.exists('stock_monitor.log')}, {os.path.exists(self.state_file)}")
+            
+        except Exception as e:
+            print(f"Error ensuring files exist: {e}")
 
     def check_product_availability(self, product: Product) -> Dict:
         """Check if a specific product is available"""
@@ -227,4 +248,231 @@ class StockMonitor:
         """Fallback text-based availability check"""
         content_lower = content.lower()
         
-        #
+        # Check for out of stock indicators
+        out_of_stock_patterns = [
+            'out of stock', 'sold out', 'currently unavailable',
+            'notify when available', 'coming soon', 'not available'
+        ]
+        
+        for pattern in out_of_stock_patterns:
+            if pattern in content_lower:
+                return False
+        
+        # Check for in stock indicators
+        in_stock_patterns = [
+            'add to cart', 'buy now', 'in stock', 'available'
+        ]
+        
+        for pattern in in_stock_patterns:
+            if pattern in content_lower:
+                return True
+        
+        # Default to False if we can't determine
+        return False
+
+    def extract_price(self, content: str, product: Product) -> Optional[str]:
+        """Extract price from product page"""
+        try:
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(content, 'html.parser')
+            
+            # Try multiple price selectors
+            price_selectors = [
+                '.price', '.product-price', '.selling-price', '.mrp',
+                '[class*="price"]', '[class*="cost"]'
+            ]
+            
+            for selector in price_selectors:
+                price_elem = soup.select_one(selector)
+                if price_elem:
+                    price_text = price_elem.get_text(strip=True)
+                    # Clean up price text
+                    price_match = re.search(r'₹[\d,]+(?:\.\d{2})?', price_text)
+                    if price_match:
+                        return price_match.group()
+            
+            # Fallback regex search
+            price_match = re.search(r'₹[\d,]+(?:\.\d{2})?', content)
+            if price_match:
+                return price_match.group()
+                
+        except ImportError:
+            # Fallback without BeautifulSoup
+            price_match = re.search(r'₹[\d,]+(?:\.\d{2})?', content)
+            if price_match:
+                return price_match.group()
+        except Exception as e:
+            logging.warning(f"Error extracting price for {product.name}: {e}")
+        
+        return None
+
+    def format_notification_message(self, product: Product, status: Dict, status_change: str) -> str:
+        """Format notification message"""
+        message = f"🏪 <b>Amul Stock Alert</b>\n\n"
+        message += f"📦 <b>Product:</b> {product.name}\n"
+        message += f"📊 <b>Status:</b> {status_change}\n"
+        
+        if status.get('price'):
+            message += f"💰 <b>Price:</b> {status['price']}\n"
+        
+        message += f"🔗 <b>Link:</b> {product.url}\n"
+        message += f"⏰ <b>Checked:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        
+        return message
+
+    def send_telegram_message(self, message: str) -> bool:
+        """Send message via Telegram"""
+        if not self.telegram_bot_token or not self.telegram_chat_id:
+            logging.warning("Telegram credentials not configured")
+            return False
+        
+        try:
+            url = f"https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage"
+            payload = {
+                'chat_id': self.telegram_chat_id,
+                'text': message,
+                'parse_mode': 'HTML'
+            }
+            
+            response = requests.post(url, json=payload, timeout=10)
+            response.raise_for_status()
+            
+            logging.info("Telegram message sent successfully")
+            return True
+            
+        except Exception as e:
+            logging.error(f"Error sending Telegram message: {e}")
+            return False
+
+    def send_email(self, subject: str, body: str) -> bool:
+        """Send email notification"""
+        if not all([self.email_from, self.email_password, self.email_to]):
+            logging.warning("Email credentials not configured")
+            return False
+        
+        try:
+            msg = MIMEMultipart()
+            msg['From'] = self.email_from
+            msg['To'] = self.email_to
+            msg['Subject'] = subject
+            
+            msg.attach(MIMEText(body, 'html'))
+            
+            server = smtplib.SMTP(self.smtp_server, self.smtp_port)
+            server.starttls()
+            server.login(self.email_from, self.email_password)
+            
+            text = msg.as_string()
+            server.sendmail(self.email_from, self.email_to, text)
+            server.quit()
+            
+            logging.info("Email sent successfully")
+            return True
+            
+        except Exception as e:
+            logging.error(f"Error sending email: {e}")
+            return False
+        
+    def monitor_products(self):
+        """Main monitoring function - UPDATED VERSION"""
+        logging.info("Starting product monitoring...")
+        
+        # NEW: Ensure files exist at the start
+        self.ensure_files_exist()
+        
+        current_state = {
+            'last_run': datetime.now().isoformat(),
+            'run_count': self.previous_state.get('run_count', 0) + 1
+        }
+        notifications_sent = []
+        
+        try:
+            for product in self.products:
+                logging.info(f"Checking {product.name}...")
+                
+                status = self.check_product_availability(product)
+                current_state[product.name] = status
+                
+                # Check if status changed
+                previous_status = self.previous_state.get(product.name, {})
+                previous_available = previous_status.get('available', False)
+                current_available = status['available']
+                
+                if previous_available != current_available:
+                    status_change = "Available ✅" if current_available else "Out of Stock ❌"
+                    message = self.format_notification_message(product, status, status_change)
+                    
+                    # Send notifications
+                    telegram_sent = self.send_telegram_message(message)
+                    email_sent = self.send_email(
+                        f"Amul Stock Alert: {product.name} - {status_change}",
+                        message.replace('<b>', '').replace('</b>', '').replace('\n', '<br>')
+                    )
+                    
+                    notifications_sent.append({
+                        'product': product.name,
+                        'status': status_change,
+                        'telegram_sent': telegram_sent,
+                        'email_sent': email_sent
+                    })
+                    
+                    logging.info(f"Status changed for {product.name}: {status_change}")
+                
+                # Rate limiting
+                time.sleep(2)
+        
+        except Exception as e:
+            logging.error(f"Error during monitoring: {e}")
+            current_state['error'] = str(e)
+        
+        finally:
+            # Always save state and ensure files exist, even if there were errors
+            try:
+                current_state['notifications_sent'] = len(notifications_sent)
+                self.save_state(current_state)
+                self.previous_state = current_state
+                
+                # Log a final message to ensure log file has content
+                logging.info(f"Monitoring cycle completed. Checked {len(self.products)} products.")
+                
+                # Verify files were created
+                print(f"Final file check - State file exists: {os.path.exists(self.state_file)}")
+                print(f"Final file check - Log file exists: {os.path.exists('stock_monitor.log')}")
+                
+            except Exception as e:
+                print(f"Error in finally block: {e}")
+        
+        # Log summary
+        if notifications_sent:
+            logging.info(f"Sent {len(notifications_sent)} notifications")
+            for notification in notifications_sent:
+                logging.info(f"  {notification}")
+        else:
+            logging.info("No status changes detected")
+
+def main():
+    """Main function to run the monitor"""
+    print("=== Starting Amul Stock Monitor ===")
+    try:
+        monitor = StockMonitor()
+        monitor.monitor_products()
+        print("=== Stock Monitor Completed Successfully ===")
+    except KeyboardInterrupt:
+        logging.info("Monitoring stopped by user")
+        print("=== Monitoring Stopped by User ===")
+    except Exception as e:
+        logging.error(f"Unexpected error: {e}")
+        print(f"=== Unexpected Error: {e} ===")
+        
+        # Even if there's an error, try to create minimal files
+        try:
+            with open('stock_state.json', 'w') as f:
+                json.dump({
+                    'error': str(e),
+                    'timestamp': datetime.now().isoformat()
+                }, f, indent=2)
+        except:
+            pass
+
+if __name__ == "__main__":
+    main()
