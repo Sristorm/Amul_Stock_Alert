@@ -41,17 +41,30 @@ class StockMonitor:
         # Products to monitor - customize these URLs and selectors
         self.products = [
             Product(
-                name="Amul Butter 500g",
-                url="https://www.amul.com/products/butter-500g",
+                name="Amul High Protein Milk, 250 mL | Pack of 32",
+                url="https://shop.amul.com/en/product/amul-high-protein-milk-250-ml-or-pack-of-32",
                 selector="add-to-cart",  # Common selector for buy buttons
                 price_selector=".price"
             ),
             Product(
-                name="Amul Milk Powder",
-                url="https://www.amul.com/products/milk-powder",
+                name="Amul Chocolate Whey Protein, 34 g | Pack of 60 sachets",
+                url="https://shop.amul.com/en/product/amul-chocolate-whey-protein-34-g-or-pack-of-60-sachets",
+                selector="add-to-cart",
+                price_selector=".price"
+            ),
+            Product(
+                name="Amul High Protein Paneer, 400 g | Pack of 24",
+                url="https://shop.amul.com/en/product/amul-high-protein-paneer-400-g-or-pack-of-24",
+                selector="add-to-cart",
+                price_selector=".price"
+            ),
+            Product(
+                name="Amul High Protein Blueberry Shake, 200 mL | Pack of 30",
+                url="https://shop.amul.com/en/product/amul-high-protein-blueberry-shake-200-ml-or-pack-of-30",
                 selector="add-to-cart",
                 price_selector=".price"
             )
+
             # Add more products here
         ]
         
