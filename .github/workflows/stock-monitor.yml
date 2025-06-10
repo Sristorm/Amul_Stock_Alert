@@ -2,7 +2,7 @@ name: Amul Stock Monitor
 on:
   schedule:
     # Run every 30 minutes
-    - cron: '*/30 * * * *'  # Fixed: Added missing * * *
+    - cron: '*/30 * * * *'
   workflow_dispatch: # Allow manual trigger
   
 permissions:
@@ -24,7 +24,11 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install -r requirements.txt
+        pip install requests beautifulsoup4
+        # Install other dependencies if requirements.txt exists
+        if [ -f requirements.txt ]; then
+          pip install -r requirements.txt
+        fi
         
     - name: Run stock monitor
       env:
@@ -36,29 +40,60 @@ jobs:
         SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
         SMTP_PORT: ${{ secrets.SMTP_PORT }}
       run: |
+        echo "Starting stock monitor..."
         python amulStockAlert.py
-        echo "Python script completed"
-        echo "Files created:"
-        ls -la stock_* 2>/dev/null || echo "No stock files found"
+        echo "Stock monitor completed"
+        
+    - name: Check created files
+      run: |
+        echo "=== Current directory contents ==="
+        ls -la
+        echo "=== Looking for stock files ==="
+        find . -name "stock_*" -type f -exec ls -la {} \; || echo "No stock files found"
+        echo "=== File contents (if they exist) ==="
+        if [ -f "stock_state.json" ]; then
+          echo "stock_state.json exists:"
+          cat stock_state.json
+        else
+          echo "stock_state.json does not exist"
+        fi
+        if [ -f "stock_monitor.log" ]; then
+          echo "stock_monitor.log exists (last 10 lines):"
+          tail -10 stock_monitor.log
+        else
+          echo "stock_monitor.log does not exist"
+        fi
       
     - name: Commit and push state file
       run: |
         git config --local user.email "action@github.com"
         git config --local user.name "GitHub Action"
         
-        # Check what files exist
-        echo "Checking for files to commit:"
-        ls -la stock_* 2>/dev/null || echo "No stock files found"
+        # Check git status
+        echo "=== Git status before adding files ==="
+        git status
         
-        # Add files if they exist
-        git add stock_state.json 2>/dev/null || echo "stock_state.json not found"
-        git add stock_monitor.log 2>/dev/null || echo "stock_monitor.log not found"
+        # Add files that exist
+        files_to_add=""
+        if [ -f "stock_state.json" ]; then
+          git add stock_state.json
+          files_to_add="$files_to_add stock_state.json"
+        fi
+        if [ -f "stock_monitor.log" ]; then
+          git add stock_monitor.log  
+          files_to_add="$files_to_add stock_monitor.log"
+        fi
+        
+        echo "=== Git status after adding files ==="
+        git status
         
         # Check for staged changes
         if git diff --staged --quiet; then
           echo "No changes to commit"
         else
-          echo "Committing changes..."
+          echo "Committing changes for files: $files_to_add"
           git commit -m "Update stock monitoring state [skip ci]"
+          echo "Pushing changes..."
           git push
+          echo "Push completed"
         fi
